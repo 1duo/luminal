@@ -1,7 +1,7 @@
 use std::{
     ffi::{CString, c_char, c_int, c_void},
     ptr::NonNull,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use itertools::Itertools;
@@ -18,7 +18,10 @@ use luminal::{
     shape::Expression,
 };
 
-use crate::{codegen::BinaryOp, config::HexagonConfig, kernel::HexagonKernelOp};
+use crate::{
+    config::HexagonConfig,
+    kernel::{HexagonDispatch, HexagonKernelOp},
+};
 
 const RPCMEM_HEAP_ID_SYSTEM: c_int = 25;
 const RPCMEM_DEFAULT_FLAGS: u32 = 1;
@@ -184,17 +187,39 @@ impl FastRpcSession {
 
     fn compute(
         &self,
-        op: BinaryOp,
-        n: usize,
+        dispatch: HexagonDispatch,
+        output_elements: usize,
+        dyn_map: &DynMap,
         a: &DeviceBuffer,
         b: &DeviceBuffer,
         out: &DeviceBuffer,
     ) -> Result<(), String> {
-        let n =
-            u32::try_from(n).map_err(|_| "Hexagon dispatch exceeds u32 elements".to_string())?;
+        let (op, n, m, k, flags) = match dispatch {
+            HexagonDispatch::F32(op) => (
+                op as u32,
+                u32::try_from(output_elements)
+                    .map_err(|_| "Hexagon dispatch exceeds u32 elements".to_string())?,
+                0,
+                0,
+                0,
+            ),
+            HexagonDispatch::MatmulI8 { m, n, k, variant } => (
+                crate::BinaryOp::MatmulI8 as u32,
+                u32::try_from(n.exec(dyn_map).unwrap_or(0))
+                    .map_err(|_| "Hexagon matmul N exceeds u32".to_string())?,
+                u32::try_from(m.exec(dyn_map).unwrap_or(0))
+                    .map_err(|_| "Hexagon matmul M exceeds u32".to_string())?,
+                u32::try_from(k.exec(dyn_map).unwrap_or(0))
+                    .map_err(|_| "Hexagon matmul K exceeds u32".to_string())?,
+                variant as u32,
+            ),
+        };
         let mut primitive = [
-            op as u32,
+            op,
             n,
+            m,
+            k,
+            flags,
             u32::try_from(a.logical_bytes)
                 .map_err(|_| "Hexagon input buffer exceeds u32 bytes".to_string())?,
             u32::try_from(b.logical_bytes)
@@ -236,7 +261,7 @@ impl FastRpcSession {
         let error = unsafe { (self.api.remote_invoke)(self.handle, scalars, args.as_mut_ptr()) };
         if error != 0 {
             return Err(format!(
-                "Hexagon compute op={op:?} n={n} failed: 0x{error:08x}"
+                "Hexagon compute dispatch={dispatch:?} failed: 0x{error:08x}"
             ));
         }
         Ok(())
@@ -264,7 +289,7 @@ struct ExecutionStep {
     node: NodeIndex,
     input_nodes: Vec<NodeIndex>,
     output_size: Expression,
-    op: BinaryOp,
+    dispatch: HexagonDispatch,
 }
 
 struct CompiledBucket {
@@ -379,6 +404,43 @@ impl HexagonRuntime {
         output
     }
 
+    pub fn get_i32(&self, id: impl ToId) -> Vec<i32> {
+        let (ptr, bytes, dtype) = self.output_buffer(id.to_id());
+        assert_eq!(dtype, DType::Int, "Hexagon output is not Int");
+        assert_eq!(bytes % std::mem::size_of::<i32>(), 0);
+        let mut output = vec![0; bytes / std::mem::size_of::<i32>()];
+        if bytes > 0 {
+            // SAFETY: output is correctly sized and the shared buffer is valid
+            // after the synchronous compute call.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    ptr.as_ptr().cast::<u8>(),
+                    output.as_mut_ptr().cast::<u8>(),
+                    bytes,
+                );
+            }
+        }
+        output
+    }
+
+    pub fn get_i8(&self, id: impl ToId) -> Vec<i8> {
+        let (ptr, bytes, dtype) = self.output_buffer(id.to_id());
+        assert_eq!(dtype, DType::I8, "Hexagon output is not I8");
+        let mut output = vec![0; bytes];
+        if bytes > 0 {
+            // SAFETY: output is correctly sized and the shared buffer is valid
+            // after the synchronous compute call.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    ptr.as_ptr().cast::<u8>(),
+                    output.as_mut_ptr().cast::<u8>(),
+                    bytes,
+                );
+            }
+        }
+        output
+    }
+
     fn input_dtype(&self, id: NodeIndex) -> Option<DType> {
         self.buckets.iter().find_map(|bucket| {
             bucket.graph.node_indices().find_map(|node| {
@@ -431,6 +493,43 @@ impl HexagonRuntime {
         }
     }
 
+    /// Profile one fully extracted candidate. FastRPC is synchronous, so the
+    /// wall-clock sample includes the dispatch and shared-buffer completion
+    /// cost that the caller actually pays.
+    fn profile_llir(
+        &mut self,
+        llir_graph: &LLIRGraph,
+        dyn_map: &DynMap,
+        trials: usize,
+        timeout: Option<Duration>,
+        early_stop: Option<(Duration, f64)>,
+    ) -> (Duration, String) {
+        self.load_llir(llir_graph);
+        self.allocate_intermediates(dyn_map);
+
+        let trials = trials.max(1);
+        let started = Instant::now();
+        let mut duration = Duration::ZERO;
+        let mut completed = 0;
+        for _ in 0..trials {
+            let trial_started = Instant::now();
+            self.execute(dyn_map);
+            duration += trial_started.elapsed();
+            completed += 1;
+
+            if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+                break;
+            }
+            if early_stop.is_some_and(|(best, factor)| {
+                luminal::op::early_stop_exceeded(duration / completed as u32, best, factor)
+            }) {
+                break;
+            }
+        }
+        duration /= completed as u32;
+        (duration, format!("{duration:.2?}"))
+    }
+
     fn compile_bucket(&self, bucket_indices: DynMap, graph: &LLIRGraph) -> CompiledBucket {
         let graph = graph.clone();
         let mut llir_to_hlir = FxHashMap::default();
@@ -458,7 +557,7 @@ impl HexagonRuntime {
                 .map(|edge| edge.source())
                 .collect();
             if input_nodes.len() != 2 || !op.is_contiguous() {
-                panic!("Hexagon v73 MVP requires contiguous binary F32 ops at {node:?}");
+                panic!("Hexagon v73 received an unsupported layout at {node:?}");
             }
             let input_dtypes: Vec<_> = input_nodes
                 .iter()
@@ -469,15 +568,27 @@ impl HexagonRuntime {
                         .unwrap_or_else(|| panic!("missing dtype for Hexagon input {input:?}"))
                 })
                 .collect();
-            if input_dtypes.iter().any(|dtype| *dtype != DType::F32) {
-                panic!("Hexagon v73 MVP only supports F32 binary ops at {node:?}");
-            }
-            node_dtypes.insert(node, DType::F32);
+            let dispatch = op.dispatch();
+            let output_dtype = match dispatch {
+                HexagonDispatch::F32(_) => {
+                    if input_dtypes.iter().any(|dtype| *dtype != DType::F32) {
+                        panic!("Hexagon F32 kernel received non-F32 inputs at {node:?}");
+                    }
+                    DType::F32
+                }
+                HexagonDispatch::MatmulI8 { .. } => {
+                    if input_dtypes.iter().any(|dtype| *dtype != DType::I8) {
+                        panic!("Hexagon I8 matmul received non-I8 inputs at {node:?}");
+                    }
+                    DType::Int
+                }
+            };
+            node_dtypes.insert(node, output_dtype);
             steps.push(ExecutionStep {
                 node,
                 input_nodes,
                 output_size: op.output_size(),
-                op: op.binary_op(),
+                dispatch,
             });
         }
 
@@ -528,10 +639,12 @@ impl HexagonRuntime {
                 .iter()
                 .map(|step| {
                     let elements = step.output_size.exec(dyn_map).unwrap_or(0);
-                    (
-                        step.node,
-                        elements.saturating_mul(std::mem::size_of::<f32>()),
-                    )
+                    let dtype = *bucket
+                        .node_dtypes
+                        .get(&step.node)
+                        .expect("Hexagon step has no output dtype");
+                    let bytes_per_element = dtype.bits().div_ceil(8);
+                    (step.node, elements.saturating_mul(bytes_per_element))
                 })
                 .collect()
         };
@@ -628,20 +741,52 @@ impl Runtime for HexagonRuntime {
         &mut self,
         space: &luminal::search::SearchSpace,
         dyn_map: &DynMap,
-        _options: &luminal::graph::CompileOptions,
+        options: &luminal::graph::CompileOptions,
         rng: &mut dyn luminal::prelude::RngCore,
     ) {
-        let contexts = space.bucket_contexts(dyn_map);
-        let selected: Vec<_> = contexts
-            .iter()
-            .map(|context| luminal::search::extract_one_selected(space, context, rng))
-            .collect();
-        self.selected_schedule = SelectedSchedule::from_search(space, &selected);
-        let buckets: Vec<_> = selected
-            .into_iter()
-            .map(|program| program.into_bucket_llir())
-            .collect();
-        self.load_llir_buckets(&space.dim_buckets, &buckets);
+        // A runtime can be compiled before inputs are uploaded (the common
+        // Luminal API pattern), so retain the cheap extraction path there.
+        // When callers preload inputs, use the same target-profiled genetic
+        // search used by the other device backends.
+        if self.input_data.is_empty() {
+            let contexts = space.bucket_contexts(dyn_map);
+            let selected: Vec<_> = contexts
+                .iter()
+                .map(|context| luminal::search::extract_one_selected(space, context, rng))
+                .collect();
+            self.selected_schedule = SelectedSchedule::from_search(space, &selected);
+            let buckets: Vec<_> = selected
+                .into_iter()
+                .map(|program| program.into_bucket_llir())
+                .collect();
+            self.load_llir_buckets(&space.dim_buckets, &buckets);
+            return;
+        }
+
+        let trials = options.trials;
+        let timeout = options.execution_timeout;
+        let selected = luminal::search::genetic_search(
+            space,
+            dyn_map,
+            options,
+            rng,
+            self,
+            |rt, candidate: &mut luminal::search::Candidate<Duration>, _| {
+                let (duration, display) = rt.profile_llir(
+                    &candidate.llir,
+                    &candidate.profile_dyn_map,
+                    trials,
+                    timeout,
+                    candidate.early_stop,
+                );
+                luminal::search::Outcome::Measured(duration, display)
+            },
+            |_, _: &luminal::search::PendingFinalist<Duration>, _| Ok(()),
+            |_, _| Ok(()),
+            |metrics| metrics.iter().copied().sum(),
+        );
+        self.selected_schedule = None;
+        self.load_llir_buckets(&space.dim_buckets, &selected);
     }
 
     fn selected_schedule(&self) -> Option<SelectedSchedule> {
@@ -701,13 +846,13 @@ impl Runtime for HexagonRuntime {
                         .buffers
                         .get(&step.node)
                         .unwrap_or_else(|| panic!("Hexagon output buffer is missing"));
-                    (step.op, n, inputs, output)
+                    (step.dispatch, n, inputs, output)
                 })
                 .collect()
         };
-        for (op, n, inputs, output) in dispatches {
+        for (dispatch, n, inputs, output) in dispatches {
             self.session
-                .compute(op, n, inputs[0], inputs[1], output)
+                .compute(dispatch, n, dyn_map, inputs[0], inputs[1], output)
                 .unwrap_or_else(|error| panic!("{error}"));
         }
     }
@@ -727,9 +872,11 @@ impl RuntimeStats for HexagonRuntime {
     }
 }
 
-fn reference_bytes(data: &ReferenceData, dtype: DType) -> Vec<u8> {
+pub(crate) fn reference_bytes(data: &ReferenceData, dtype: DType) -> Vec<u8> {
     match dtype {
         DType::F32 => bytemuck::cast_slice(data.to_f32_vec().as_slice()).to_vec(),
+        DType::Int => bytemuck::cast_slice(data.to_i32_vec().as_slice()).to_vec(),
+        DType::I8 => bytemuck::cast_slice(data.to_i8_vec().as_slice()).to_vec(),
         unsupported => panic!("Hexagon input dtype {unsupported:?} is unsupported"),
     }
 }

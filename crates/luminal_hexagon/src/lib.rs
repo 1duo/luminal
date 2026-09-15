@@ -7,10 +7,17 @@
 //! * The Hexagon SDK builds the v73 DSP shared object in `device/`.
 //! * FastRPC dispatches that object and `rpcmem` buffers keep intermediate
 //!   tensors shared across calls.
+//! * I8 projection GEMM uses signed byte inputs and signed I32 accumulation;
+//!   scalar and HVX schedules remain ordinary e-graph alternatives.
 //!
-//! The initial operation set is contiguous F32 elementwise Add and Mul. It is
-//! intentionally narrow so the memory and ABI invariants are easy to verify
-//! on a real Snapdragon X Elite before adding larger kernels.
+//! The SDK installed on the development host has no public HexKL compiler or
+//! library. `codegen` is therefore a narrow, replaceable SDK C/HVX emitter;
+//! an official HexKL backend can plug into that boundary without moving
+//! pattern matching or search out of egglog.
+//!
+//! The operation set is intentionally narrow so the memory, dtype, and ABI
+//! invariants are easy to verify on a real Snapdragon X Elite before adding
+//! larger kernels.
 
 pub mod codegen;
 pub mod config;

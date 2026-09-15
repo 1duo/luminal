@@ -45,7 +45,8 @@ cargo run --release
 ```
 
 The Snapdragon X Elite HTP is supported by the Hexagon SDK backend for
-contiguous F32 elementwise kernels:
+contiguous F32 elementwise kernels and a signed-I8 projection (`I8 × I8 →
+I32`):
 
 ```toml
 luminal = "0.2"
@@ -54,7 +55,16 @@ luminal_hexagon = "0.2"
 
 Build and sign the v73 skel from `crates/luminal_hexagon/device`, then set
 `LUMINAL_HEXAGON_RPC_DLL` and `LUMINAL_HEXAGON_SKEL_URI` before creating
-`HexagonRuntime`.
+`HexagonRuntime`. The minimal HTP validation is:
+
+```powershell
+cargo run --release -p luminal_hexagon --example integer
+```
+
+The backend keeps kernel selection in Luminal's egglog search. Scalar and HVX
+I8 GEMM schedules are equivalent alternatives and are target-profiled when
+inputs are preloaded; `crates/luminal_hexagon/src/codegen.rs` is the narrow
+SDK emitter boundary for a future HexKL integration.
 
 ## Features
 

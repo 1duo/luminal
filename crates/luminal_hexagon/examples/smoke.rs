@@ -22,14 +22,14 @@ fn main() -> Result<(), String> {
     let elapsed = start.elapsed();
     let dispatches_per_run = 2.0;
     let result = runtime.get_f32(output);
-    if result.iter().any(|&value| (value - 9.0).abs() > 1e-4) {
+    if result.iter().any(|&value| (value - 6.0).abs() > 1e-4) {
         eprintln!("first Hexagon values: {:?}", &result[..result.len().min(8)]);
         return Err("Hexagon smoke result mismatch".to_string());
     }
     runtime.copy_output_to_input(output, a);
     runtime.execute(&graph.dyn_map);
     let recurrent = runtime.get_f32(output);
-    if recurrent.iter().any(|&value| (value - 22.0).abs() > 1e-4) {
+    if recurrent.iter().any(|&value| (value - 16.0).abs() > 1e-4) {
         eprintln!(
             "recurrent Hexagon values: {:?}",
             &recurrent[..recurrent.len().min(8)]

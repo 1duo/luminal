@@ -39,6 +39,10 @@ impl DynBackend for HexagonDynBackend {
         self.runtime.get_f32(node)
     }
 
+    fn get_output_i32(&self, node: NodeIndex) -> Vec<i32> {
+        self.runtime.get_i32(node)
+    }
+
     fn execute(&mut self, dyn_map: &DynMap, stream: Option<u64>) {
         assert!(
             stream.is_none(),
@@ -51,10 +55,10 @@ impl DynBackend for HexagonDynBackend {
 fn validate_graph(graph: &Graph) -> Result<(), String> {
     for node in graph.graph.node_indices() {
         if let Some(input) = (*graph.graph[node]).as_any().downcast_ref::<Input>()
-            && input.dtype != DType::F32
+            && !matches!(input.dtype, DType::F32 | DType::I8)
         {
             return Err(format!(
-                "Hexagon v73 backend only supports F32 inputs; `{}` is {:?}",
+                "Hexagon v73 backend only supports F32 or I8 inputs; `{}` is {:?}",
                 input.label, input.dtype
             ));
         }
