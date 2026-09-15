@@ -1,0 +1,8 @@
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+interface luminal_hexagon : remote_handle64 {
+    AEEResult compute(in uint32 op, in uint32 n,
+                      in sequence<octet> a, in sequence<octet> b,
+                      rout sequence<octet> result);
+};

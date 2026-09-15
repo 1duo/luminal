@@ -44,6 +44,18 @@ cd ./examples/llama
 cargo run --release
 ```
 
+The Snapdragon X Elite HTP is supported by the Hexagon SDK backend for
+contiguous F32 elementwise kernels:
+
+```toml
+luminal = "0.2"
+luminal_hexagon = "0.2"
+```
+
+Build and sign the v73 skel from `crates/luminal_hexagon/device`, then set
+`LUMINAL_HEXAGON_RPC_DLL` and `LUMINAL_HEXAGON_SKEL_URI` before creating
+`HexagonRuntime`.
+
 ## Features
 
 ### Speed

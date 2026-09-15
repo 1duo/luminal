@@ -1,0 +1,16 @@
+[package]
+name = "luminal_hexagon"
+version = "0.2.0"
+edition = "2024"
+description = "Hexagon SDK/HVX backend for Luminal on Snapdragon X Elite"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bytemuck = "1.24.0"
+half = "2.7.1"
+libloading = "0.8.8"
+luminal = { path = "../.." }
+itertools = "0.12.1"
+
+[dev-dependencies]
+luminal_nn = { path = "../luminal_nn" }
