@@ -23,12 +23,17 @@ pub mod codegen;
 pub mod config;
 pub mod dyn_backend;
 pub mod kernel;
+pub mod qwen35;
 pub mod runtime;
 
 pub use codegen::{BinaryOp, emit_dsp_source};
 pub use config::HexagonConfig;
 pub use dyn_backend::{HexagonDynBackend, hexagon_factory};
 pub use kernel::HexagonOps;
+pub use qwen35::{
+    HF_FILENAME, HF_REPOSITORY, Qwen35Q4Config, Qwen35Q4Step, Qwen35Runtime, Qwen35Token,
+    qwen35_q4_step, validate_qwen35_q4_weights,
+};
 pub use runtime::HexagonRuntime;
 
 #[cfg(test)]

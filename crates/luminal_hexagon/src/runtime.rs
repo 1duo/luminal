@@ -28,18 +28,18 @@ const RPCMEM_DEFAULT_FLAGS: u32 = 1;
 const DSPRPC_CONTROL_UNSIGNED_MODULE: u32 = 2;
 const COMPUTE_METHOD_ID: u32 = 2;
 
-type RemoteHandle64 = u64;
+pub(crate) type RemoteHandle64 = u64;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct RemoteBuf {
+pub(crate) struct RemoteBuf {
     pv: *mut c_void,
     n_len: usize,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-union RemoteArg {
+pub(crate) union RemoteArg {
     buf: RemoteBuf,
     h64: RemoteHandle64,
 }
@@ -58,8 +58,11 @@ type RpcmemInit = unsafe extern "C" fn();
 type RpcmemDeinit = unsafe extern "C" fn();
 type RpcmemAlloc2 = unsafe extern "C" fn(c_int, u32, usize) -> *mut c_void;
 type RpcmemFree = unsafe extern "C" fn(*mut c_void);
+type RpcmemToFd = unsafe extern "C" fn(*mut c_void) -> c_int;
+type FastrpcMmap = unsafe extern "C" fn(c_int, c_int, *mut c_void, c_int, usize, u32) -> c_int;
+type FastrpcMunmap = unsafe extern "C" fn(c_int, c_int, *mut c_void, usize) -> c_int;
 
-struct FastRpcApi {
+pub(crate) struct FastRpcApi {
     // The library must outlive all copied function pointers.
     _library: Library,
     remote_open: RemoteOpen,
@@ -70,6 +73,9 @@ struct FastRpcApi {
     rpcmem_deinit: RpcmemDeinit,
     rpcmem_alloc2: RpcmemAlloc2,
     rpcmem_free: RpcmemFree,
+    rpcmem_to_fd: Option<RpcmemToFd>,
+    fastrpc_mmap: Option<FastrpcMmap>,
+    fastrpc_munmap: Option<FastrpcMunmap>,
 }
 
 impl FastRpcApi {
@@ -101,6 +107,12 @@ impl FastRpcApi {
                 })
         }
 
+        unsafe fn optional_symbol<T: Copy>(library: &Library, name: &[u8]) -> Option<T> {
+            // SAFETY: optional symbols use the same ABI contract as required
+            // symbols; the library is retained by FastRpcApi.
+            unsafe { library.get::<T>(name) }.ok().map(|symbol| *symbol)
+        }
+
         Ok(Self {
             remote_open: unsafe { symbol(&library, b"remote_handle64_open\0") }?,
             remote_close: unsafe { symbol(&library, b"remote_handle64_close\0") }?,
@@ -110,18 +122,22 @@ impl FastRpcApi {
             rpcmem_deinit: unsafe { symbol(&library, b"rpcmem_deinit\0") }?,
             rpcmem_alloc2: unsafe { symbol(&library, b"rpcmem_alloc2\0") }?,
             rpcmem_free: unsafe { symbol(&library, b"rpcmem_free\0") }?,
+            rpcmem_to_fd: unsafe { optional_symbol(&library, b"rpcmem_to_fd\0") },
+            fastrpc_mmap: unsafe { optional_symbol(&library, b"fastrpc_mmap\0") },
+            fastrpc_munmap: unsafe { optional_symbol(&library, b"fastrpc_munmap\0") },
             _library: library,
         })
     }
 }
 
-struct FastRpcSession {
+pub(crate) struct FastRpcSession {
     api: FastRpcApi,
     handle: RemoteHandle64,
+    domain: c_int,
 }
 
 impl FastRpcSession {
-    fn open(config: &HexagonConfig) -> Result<Self, String> {
+    pub(crate) fn open(config: &HexagonConfig) -> Result<Self, String> {
         let api = FastRpcApi::load(config)?;
         // SAFETY: the SDK documents rpcmem_init as the process-level setup
         // call and it has no arguments or return value.
@@ -160,10 +176,14 @@ impl FastRpcSession {
                 config.skel_uri
             ));
         }
-        Ok(Self { api, handle })
+        Ok(Self {
+            api,
+            handle,
+            domain: config.domain,
+        })
     }
 
-    fn allocate(&self, logical_bytes: usize) -> Result<DeviceBuffer, String> {
+    pub(crate) fn allocate(&self, logical_bytes: usize) -> Result<DeviceBuffer, String> {
         let allocation_bytes = logical_bytes.max(1);
         // SAFETY: the SDK allocator accepts the system heap and returns a
         // shared host/DSP buffer or null.
@@ -179,7 +199,7 @@ impl FastRpcSession {
         Ok(DeviceBuffer { ptr, logical_bytes })
     }
 
-    unsafe fn free(&self, buffer: DeviceBuffer) {
+    pub(crate) unsafe fn free(&self, buffer: DeviceBuffer) {
         // SAFETY: the pointer came from this SDK allocator and is released
         // exactly once by the owning runtime.
         unsafe { (self.api.rpcmem_free)(buffer.ptr.as_ptr()) };
@@ -253,8 +273,8 @@ impl FastRpcSession {
                 },
             },
         ];
-        // The primitive scalar block is not included in the buffer counts;
-        // the two inputs and one rout output are the three RPC buffers.
+        // QAIC counts the primitive scalar block as the first input buffer;
+        // the two tensor inputs make three input buffers in total.
         let scalars = (COMPUTE_METHOD_ID << 24) | (3 << 16) | (1 << 8);
         // SAFETY: all four descriptors and their backing shared buffers remain
         // alive until the synchronous FastRPC invocation returns.
@@ -265,6 +285,185 @@ impl FastRpcSession {
             ));
         }
         Ok(())
+    }
+
+    /// Invoke the resident-model `compute(sequence<octet>, rout sequence<octet>)`
+    /// ABI used by hexinfer. The primitive block contains the input and output
+    /// byte lengths, followed by one input and one output RemoteArg.
+    pub(crate) fn invoke_raw(
+        &self,
+        method_id: u32,
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+    ) -> Result<(), String> {
+        let mut primitive = [
+            u32::try_from(input.logical_bytes)
+                .map_err(|_| "FastRPC input buffer exceeds u32 bytes".to_string())?,
+            u32::try_from(output.logical_bytes)
+                .map_err(|_| "FastRPC output buffer exceeds u32 bytes".to_string())?,
+        ];
+        let mut args = [
+            RemoteArg {
+                buf: RemoteBuf {
+                    pv: primitive.as_mut_ptr().cast(),
+                    n_len: std::mem::size_of_val(&primitive),
+                },
+            },
+            RemoteArg {
+                buf: RemoteBuf {
+                    pv: input.ptr.as_ptr(),
+                    n_len: input.logical_bytes,
+                },
+            },
+            RemoteArg {
+                buf: RemoteBuf {
+                    pv: output.ptr.as_ptr(),
+                    n_len: output.logical_bytes,
+                },
+            },
+        ];
+        // QAIC counts the primitive scalar block as the first input buffer;
+        // the resident request is the second input buffer.
+        let scalars = (method_id << 24) | (2 << 16) | (1 << 8);
+        // SAFETY: all descriptors and backing buffers remain alive until the
+        // synchronous FastRPC call returns.
+        let error = unsafe { (self.api.remote_invoke)(self.handle, scalars, args.as_mut_ptr()) };
+        if error != 0 {
+            return Err(format!(
+                "FastRPC resident method {method_id} failed: 0x{error:08x}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Invoke an ABI method with one `rout sequence<octet>` and no input
+    /// sequence, such as `hexinfer_stop`. The primitive block carries the
+    /// output capacity and is followed by the output buffer itself.
+    pub(crate) fn invoke_output(
+        &self,
+        method_id: u32,
+        output: &DeviceBuffer,
+    ) -> Result<(), String> {
+        let mut primitive = [u32::try_from(output.logical_bytes)
+            .map_err(|_| "FastRPC output buffer exceeds u32 bytes".to_string())?];
+        let mut args = [
+            RemoteArg {
+                buf: RemoteBuf {
+                    pv: primitive.as_mut_ptr().cast(),
+                    n_len: std::mem::size_of_val(&primitive),
+                },
+            },
+            RemoteArg {
+                buf: RemoteBuf {
+                    pv: output.ptr.as_ptr(),
+                    n_len: output.logical_bytes,
+                },
+            },
+        ];
+        // The primitive scalar block is the one input buffer; the output
+        // sequence is the one rout buffer.
+        let scalars = (method_id << 24) | (1 << 16) | (1 << 8);
+        // SAFETY: both descriptors and the output allocation remain valid for
+        // the synchronous FastRPC call.
+        let error = unsafe { (self.api.remote_invoke)(self.handle, scalars, args.as_mut_ptr()) };
+        if error != 0 {
+            return Err(format!(
+                "FastRPC output method {method_id} failed: 0x{error:08x}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Invoke a method whose arguments are one primitive scalar block and no
+    /// sequence buffers, such as the resident mapping methods.
+    pub(crate) fn invoke_scalars(&self, method_id: u32, scalars_in: &[u32]) -> Result<(), String> {
+        if scalars_in.is_empty() {
+            // SAFETY: this method has no RemoteArg payload.
+            let error = unsafe {
+                (self.api.remote_invoke)(self.handle, method_id << 24, std::ptr::null_mut())
+            };
+            if error != 0 {
+                return Err(format!(
+                    "FastRPC resident method {method_id} failed: 0x{error:08x}"
+                ));
+            }
+            return Ok(());
+        }
+        let mut primitive = scalars_in.to_vec();
+        let mut args = [RemoteArg {
+            buf: RemoteBuf {
+                pv: primitive.as_mut_ptr().cast(),
+                n_len: std::mem::size_of_val(primitive.as_slice()),
+            },
+        }];
+        let scalars = (method_id << 24) | (1 << 16);
+        // SAFETY: the primitive descriptor remains valid for the synchronous
+        // call.
+        let error = unsafe { (self.api.remote_invoke)(self.handle, scalars, args.as_mut_ptr()) };
+        if error != 0 {
+            return Err(format!(
+                "FastRPC resident method {method_id} failed: 0x{error:08x}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn buffer_fd(&self, buffer: &DeviceBuffer) -> Result<c_int, String> {
+        let Some(to_fd) = self.api.rpcmem_to_fd else {
+            return Err("FastRPC library is missing rpcmem_to_fd".to_string());
+        };
+        // SAFETY: the pointer was returned by rpcmem_alloc2 and remains owned
+        // by the caller for the duration of this call.
+        let fd = unsafe { to_fd(buffer.ptr.as_ptr()) };
+        if fd < 0 {
+            Err("rpcmem_to_fd failed".to_string())
+        } else {
+            Ok(fd)
+        }
+    }
+
+    pub(crate) fn map_buffer(&self, buffer: &DeviceBuffer) -> Result<(), String> {
+        let Some(map) = self.api.fastrpc_mmap else {
+            return Err("FastRPC library is missing fastrpc_mmap".to_string());
+        };
+        let fd = self.buffer_fd(buffer)?;
+        // FASTRPC_MAP_FD is 2 in the Hexagon SDK enum.
+        // SAFETY: the address and size describe the live rpcmem allocation.
+        let error = unsafe {
+            map(
+                self.domain,
+                fd,
+                buffer.ptr.as_ptr(),
+                0,
+                buffer.logical_bytes,
+                2,
+            )
+        };
+        if error != 0 {
+            Err(format!(
+                "fastrpc_mmap(domain={}, fd={}, bytes={}) failed: 0x{error:08x}",
+                self.domain, fd, buffer.logical_bytes
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn unmap_buffer(&self, buffer: &DeviceBuffer) -> Result<(), String> {
+        let Some(unmap) = self.api.fastrpc_munmap else {
+            return Err("FastRPC library is missing fastrpc_munmap".to_string());
+        };
+        let fd = self.buffer_fd(buffer)?;
+        // SAFETY: this exactly reverses map_buffer for the live allocation.
+        let error = unsafe { unmap(self.domain, fd, buffer.ptr.as_ptr(), buffer.logical_bytes) };
+        if error != 0 {
+            Err(format!(
+                "fastrpc_munmap(domain={}, fd={}, bytes={}) failed: 0x{error:08x}",
+                self.domain, fd, buffer.logical_bytes
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -280,9 +479,9 @@ impl Drop for FastRpcSession {
     }
 }
 
-struct DeviceBuffer {
-    ptr: NonNull<c_void>,
-    logical_bytes: usize,
+pub(crate) struct DeviceBuffer {
+    pub(crate) ptr: NonNull<c_void>,
+    pub(crate) logical_bytes: usize,
 }
 
 struct ExecutionStep {
