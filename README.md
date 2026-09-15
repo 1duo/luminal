@@ -44,6 +44,21 @@ cd ./examples/llama
 cargo run --release
 ```
 
+**Snapdragon X Elite**
+
+The Adreno GPU in Snapdragon X Elite systems is supported through the native
+OpenCL ICD:
+
+```toml
+luminal = "0.2"
+luminal_opencl = "0.2"
+```
+
+Use `luminal_opencl::OpenClRuntime::try_initialize(0)` as the runtime. Device
+0 prefers Qualcomm's native Adreno driver when Windows also exposes the GPU
+through an OpenCL compatibility layer. Python users can build
+`luminal_python` with `--features opencl` and use `luminal.opencl_backend`.
+
 ## Features
 
 ### Speed

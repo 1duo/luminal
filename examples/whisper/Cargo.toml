@@ -6,12 +6,25 @@ edition = "2024"
 [[bin]]
 name = "whisper"
 path = "src/main.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "whisper_opencl"
+path = "src/opencl.rs"
+required-features = ["opencl"]
+
+[features]
+default = ["cuda"]
+cuda = ["dep:luminal_cuda_lite", "jemalloc"]
+opencl = ["dep:luminal_opencl"]
+jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
 luminal = { path = "../.." }
-tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms"] }
+tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms"], optional = true }
 luminal_nn = { path = "../../crates/luminal_nn" }
-luminal_cuda_lite = { path = "../../crates/luminal_cuda_lite" }
+luminal_cuda_lite = { path = "../../crates/luminal_cuda_lite", optional = true }
+luminal_opencl = { path = "../../crates/luminal_opencl", optional = true }
 luminal_tracing = { path = "../../crates/luminal_tracing" }
 tokenizers = "0.15.2"
 tracing = "0.1.43"

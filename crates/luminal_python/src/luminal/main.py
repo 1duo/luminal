@@ -122,6 +122,32 @@ def register_backend(factory_capsule):
     return backend
 
 
+def opencl_backend(gm, example_inputs, options=None):
+    """Compile CPU-visible tensors with the OpenCL backend.
+
+    Build ``luminal_python`` with ``--features opencl`` first. The backend
+    uploads host inputs to the system OpenCL GPU and copies outputs back.
+    """
+    if any(torch.is_tensor(t) and t.is_cuda for t in (example_inputs or [])):
+        raise RuntimeError(
+            "OpenCL backend expects CPU input tensors; use luminal_backend for "
+            "CUDA tensors."
+        )
+    try:
+        from .luminal import _opencl_factory_capsule
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "OpenCL backend requested, but luminal_python was not built with "
+            "the opencl feature. Rebuild with `maturin develop --features opencl`."
+        ) from exc
+    return _compile_pt2(
+        gm,
+        example_inputs,
+        _opencl_factory_capsule(),
+        search_iterations=(options or {}).get("search_iterations"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # torch.compile backend entry point (auto-detecting)
 # ---------------------------------------------------------------------------

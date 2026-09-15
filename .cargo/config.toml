@@ -2,3 +2,14 @@
 rustflags = [
     "-Ctarget-feature=+fp16,+fhm"
 ]
+
+# Snapdragon X Elite (and other ARM64 Windows machines such as the Adreno
+# X1-85 dev box): the default aarch64-pc-windows-msvc feature set lacks the
+# fullfp16/FHM extensions that gemm-f16's hand-written NEON kernels require,
+# so dev-dependency builds (candle -> gemm) fail with
+# "instruction requires: fullfp16". Mirror the Linux ARM64 flags here; the
+# Oryon CPU implements ARMv8.2+ FP16 arithmetic.
+[target.aarch64-pc-windows-msvc]
+rustflags = [
+    "-Ctarget-feature=+fp16,+fhm"
+]
